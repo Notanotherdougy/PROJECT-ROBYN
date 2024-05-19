@@ -134,7 +134,7 @@ install_mariadb() {
         echo "MariaDB not found. Installing MariaDB..."
         sudo apt update
         sudo apt install -y mariadb-server
-        sudo service mysql start
+        sudo service mariadb start
     else
         echo "MariaDB is already installed."
     fi
@@ -331,6 +331,7 @@ CONFIG_FILE="$WEBROOT/config.php"
 # Function to create database and tables
 setup_database() {
     echo "Creating MariaDB database and tables..."
+    sudo service mariadb start
     mysql -u "$DB_USER" -p"$DB_PASS" -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;
     USE $DB_NAME;
     CREATE TABLE IF NOT EXISTS users (
@@ -821,9 +822,24 @@ main() {
     # Create PHP files for user system
     create_php_files
 
-    # Create file management scripts
+    # Create organize and fix script
     create_file_management_script
+
+    # Create file management PHP script
     create_file_management_php
+
+    # Set up servers and start services
+    banner
+    install_php_apache
+    install_cloudflared
+    install_node_npm
+    delete_cloudflare_log_on_reboot
+    start_php_server
+    start_node_server
+    update_config
+    activate_telegram_bot
+    start_cloudflared
+    listen_for_telegram_commands
 
     echo "Setup completed. Navigate to your web root to access the system."
 }
