@@ -128,15 +128,15 @@ install_node_npm() {
     fi
 }
 
-# Function to install MySQL if not installed
-install_mysql() {
+# Function to install MariaDB if not already installed
+install_mariadb() {
     if ! command -v mysql &> /dev/null; then
-        echo "MySQL not found. Installing MySQL..."
+        echo "MariaDB not found. Installing MariaDB..."
         sudo apt update
-        sudo apt install -y mysql-server
+        sudo apt install -y mariadb-server
         sudo service mysql start
     else
-        echo "MySQL is already installed."
+        echo "MariaDB is already installed."
     fi
 }
 
@@ -322,7 +322,7 @@ activate_telegram_bot() {
     send_telegram_message "Bot activated successfully. Bot Token: $bot_token, Chat ID: $chat_id"
 }
 
-# MySQL Database Setup
+# MariaDB Database Setup
 DB_NAME="multi_user_system"
 DB_USER="root"
 DB_PASS=""
@@ -330,7 +330,7 @@ CONFIG_FILE="$WEBROOT/config.php"
 
 # Function to create database and tables
 setup_database() {
-    echo "Creating MySQL database and tables..."
+    echo "Creating MariaDB database and tables..."
     mysql -u "$DB_USER" -p"$DB_PASS" -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;
     USE $DB_NAME;
     CREATE TABLE IF NOT EXISTS users (
@@ -340,7 +340,7 @@ setup_database() {
         email VARCHAR(100) NOT NULL UNIQUE,
         role ENUM('admin', 'user') NOT NULL DEFAULT 'user',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );" || { echo "MySQL setup failed"; exit 1; }
+    );" || { echo "MariaDB setup failed"; exit 1; }
 }
 
 # Function to create PHP config file
@@ -809,8 +809,8 @@ main() {
     clear
     echo "Starting setup..."
 
-    # Install MySQL if not already installed
-    install_mysql
+    # Install MariaDB if not already installed
+    install_mariadb
 
     # Setup database
     setup_database
