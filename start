@@ -1,409 +1,832 @@
- #!/bin/bash
-
-__version__="1.5"
-
-## DEFAULT HOST & PORT 
-HOST='127.0.0.1'
-PORT='8090' 
-
 #!/bin/bash
 
+# Save the current directory
+current_dir=$(pwd)
 
-# Define colors
-colors=("\033[31m" "\033[32m" "\033[33m" "\033[34m" "\033[35m" "\033[36m" "\033[37m")
+# Navigate to the logs directory
+cd /mnt/c/Users/FINAL/OneDrive/Desktop/backup-sarah/.server/logs/
 
-# Reset color
-RESET="\033[0m"
+# Remove the existing cloudflared.log file
+rm cloudflared.log
 
-# Function to print each character in a different color
-colorful_echo() {
-    local str="$1"
-    local -i color_index=0
+# Recreate the cloudflared.log file
+touch cloudflared.log
 
-    for (( i=0; i<${#str}; i++ )); do
-        echo -en "${colors[$color_index]}${str:$i:1}"
-        ((color_index=(color_index+1)%${#colors[@]}))
+# Change back to the original directory
+cd "$current_dir"
+
+# Script Configuration
+VERSION="1.5"
+HOST='127.0.0.1'
+SERVER_DIR=".server"
+LOG_DIR="$SERVER_DIR/logs"
+LOG_FILE="$LOG_DIR/cloudflared.log"
+CONFIG_FILE="$SERVER_DIR/bin/config.json"
+PORT_FILE="$SERVER_DIR/bin/port.txt"
+PORT=8888  # Set the port number
+BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+CHAT_ID="YOUR_TELEGRAM_CHAT_ID"
+LAST_UPDATE_ID=""
+
+# Ensure webroot directory and index files exist
+WEBROOT=".server/www"
+INDEX_PHP="$WEBROOT/index.php"
+INDEX_HTML="$WEBROOT/index.html"
+ROBOTS_TXT="$WEBROOT/robots.txt"
+HTACCESS="$WEBROOT/.htaccess"
+
+mkdir -p "$WEBROOT"
+if [[ ! -f "$INDEX_PHP" ]]; then
+    echo "<?php echo 'Hello, PHP!'; ?>" > "$INDEX_PHP"
+fi
+if [[ ! -f "$INDEX_HTML" ]]; then
+    echo "<!DOCTYPE html><html><head><title>Hello, HTML!</title></head><body>Hello, HTML!</body></html>" > "$INDEX_HTML"
+fi
+if [[ ! -f "$ROBOTS_TXT" ]]; then
+    echo "User-agent: *" > "$ROBOTS_TXT"
+    echo "Disallow: /" >> "$ROBOTS_TXT"
+fi
+if [[ ! -f "$HTACCESS" ]]; then
+    cat << EOF > "$HTACCESS"
+RewriteEngine On
+
+# Block all IPs outside Canada
+RewriteCond %{ENV:GEOIP_COUNTRY_CODE} !^CA$
+RewriteRule ^ - [F,L]
+
+# Redirect to custom error page if requested page doesn't exist
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ /error [R=301,L]
+EOF
+fi
+
+# Ensure log directory and log file exist
+mkdir -p "$LOG_DIR"
+touch "$LOG_FILE"
+
+# Function to log file changes
+log_file_changes() {
+    local event="$1"
+    local file="$2"
+    local timestamp=$(date +"%Y-%m-%d %T")
+    echo "[$timestamp] $event: $file" >> "$LOG_FILE"
+}
+
+# Function to display a simple banner
+banner() {
+    echo "PROJECT-SARAH"
+}
+
+# Function to check if a package is installed
+check_package() {
+    local pkg="$1"
+    dpkg -s "$pkg" &> /dev/null
+}
+
+# Function to install PHP and Apache2 if not already installed
+install_php_apache() {
+    local packages=("php" "apache2")
+
+    for pkg in "${packages[@]}"; do
+        if ! check_package "$pkg"; then
+            sudo apt-get update > /dev/null
+            sudo apt-get install -y "$pkg" > /dev/null
+        fi
+    done
+}
+
+# Function to install Cloudflared if not already installed
+install_cloudflared() {
+    if [[ ! -f "$SERVER_DIR/cloudflared" ]]; then
+        local arch=$(uname -m)
+        local file="cloudflared-linux-"
+        case "$arch" in
+            arm*|*Android*) 
+                if [[ "$arch" == "armv7l" ]]; then
+                    file+="armv7"
+                else
+                    file+="arm"
+                fi
+                ;;
+            aarch64) file+="arm64" ;;
+            x86_64) file+="amd64" ;;
+            *) file+="386" ;;
+        esac
+        local url="https://github.com/cloudflare/cloudflared/releases/latest/download/$file"
+
+        # Download Cloudflared binary
+        curl -sL "$url" -o "$SERVER_DIR/cloudflared" && chmod +x "$SERVER_DIR/cloudflared"
+    fi
+}
+
+# Function to install Node.js and npm if not already installed
+install_node_npm() {
+    if ! check_package "nodejs"; then
+        curl -sL https://deb.nodesource.com/setup_14.x | sudo -E bash - > /dev/null
+        sudo apt-get install -y nodejs > /dev/null
+    fi
+}
+
+# Function to install MySQL if not installed
+install_mysql() {
+    if ! command -v mysql &> /dev/null; then
+        echo "MySQL not found. Installing MySQL..."
+        sudo apt update
+        sudo apt install -y mysql-server
+        sudo service mysql start
+    else
+        echo "MySQL is already installed."
+    fi
+}
+
+# Start the Cloudflared tunnel and create the log file
+start_cloudflared() {
+    # Start Cloudflared tunnel and wait until fully initialized
+    "$SERVER_DIR/cloudflared" tunnel --url "http://$HOST:$PORT" --logfile "$LOG_FILE" > /dev/null 2>&1 &
+    local timeout=0
+    while [[ ! -f "$LOG_FILE" ]]; do
+        sleep 1
+        timeout=$((timeout + 1))
+        if [[ $timeout -ge 10 ]]; then
+            echo "Error: Cloudflared tunnel initialization timeout."
+            return 1
+        fi
+    done
+    echo "Cloudflared tunnel started on port $PORT"
+
+    # Wait for Cloudflared to log the URL
+    timeout=0
+    local url=""
+    while [[ -z "$url" ]]; do
+        url=$(grep -o 'https://[-0-9a-z]*\.trycloudflare.com' "$LOG_FILE" | head -1)
+        sleep 1
+        timeout=$((timeout + 1))
+        if [[ $timeout -ge 10 ]]; then
+            echo "Error: Cloudflared URL retrieval timeout."
+            return 1
+        fi
     done
 
-    echo -e "$RESET"
+    # Display the Cloudflare URL
+    display_cloudflare_url "$url"
+    # Send the URL to Telegram
+    send_cloudflare_url_to_telegram "$url"
 }
 
-# Define the banner function
-banner() {
-    colorful_echo "========================================"
-    colorful_echo "+++---PROJECT-ROBYN-BY-RANDOM-RYAN---+++"
-    colorful_echo "========================================"
+# Function to display Cloudflare URL
+display_cloudflare_url() {
+    local url="$1"
+    echo "Cloudflare URL: $url"
 }
 
-## Directories
-BASE_DIR=$(realpath "$(dirname "$BASH_SOURCE")")
+# Function to delete Cloudflare logs on system reboot
+delete_cloudflare_log_on_reboot() {
+    # Create a script to delete the log file
+    echo '#!/bin/bash' > /tmp/delete_cloudflare_log.sh
+    echo "rm -f \"$LOG_FILE\"" >> /tmp/delete_cloudflare_log.sh
+    chmod +x /tmp/delete_cloudflare_log.sh
 
-if [[ ! -d ".server" ]]; then
-	mkdir -p ".server"
-fi
-
-if [[ -d ".server/www" ]]; then
-	rm -rf ".server/www"
-	mkdir -p ".server/www"
-else
-	mkdir -p ".server/www"
-fi
-
-## Remove logfile
-if [[ -e ".server/.loclx" ]]; then
-	rm -rf ".server/.loclx"
-fi
-
-if [[ -e ".server/.cld.log" ]]; then
-	rm -rf ".server/.cld.log"
-fi
-
-## Script termination
-exit_on_signal_SIGINT() {
-	{ printf "\n\n%s\n\n" "${RED}[${WHITE}!${RED}]${RED} Program Interrupted." 2>&1; reset_color; }
-	exit 0
+    # Add the script to the system's startup sequence
+    sudo mv /tmp/delete_cloudflare_log.sh /etc/init.d/
+    sudo update-rc.d delete_cloudflare_log.sh defaults
 }
 
-exit_on_signal_SIGTERM() {
-	{ printf "\n\n%s\n\n" "${RED}[${WHITE}!${RED}]${RED} Program Terminated." 2>&1; reset_color; }
-	exit 0
+# Start the PHP server
+start_php_server() {
+    if [[ ! -f "$(which php)" ]]; then
+        return 1
+    fi
+
+    if [[ ! -d "$SERVER_DIR/www" ]]; then
+        return 1
+    fi
+
+    php -S "$HOST:$PORT" -t "$SERVER_DIR/www" > /dev/null 2>&1 &
 }
 
-trap exit_on_signal_SIGINT SIGINT
-trap exit_on_signal_SIGTERM SIGTERM
+# Start the Node.js server
+start_node_server() {
+    if [[ ! -f "$(which node)" ]]; then
+        return 1
+    fi
 
-## Reset terminal colors
-reset_color() {
-	tput sgr0   # reset attributes
-	tput op     # reset color
-	return
+    if [[ ! -f "$SERVER_DIR/server.js" ]]; then
+        return 1
+    fi
+
+    node "$SERVER_DIR/server.js" "$PORT" > /dev/null 2>&1 &
 }
 
-## Kill already running process
-kill_pid() {
-	check_PID="php ngrok cloudflared loclx"
-	for process in ${check_PID}; do
-		if [[ $(pidof ${process}) ]]; then # Check for Process
-			killall ${process} > /dev/null 2>&1 # Kill the Process
-		fi
-	done
+# Function to stop the Cloudflared tunnel
+stop_cloudflared() {
+    # Check if the Cloudflared tunnel is running
+    if pgrep -x "cloudflared" > /dev/null; then
+        # If running, stop the Cloudflared tunnel
+        pkill -f "cloudflared"
+    fi
 }
 
-## Dependencies
-dependencies() {
-	echo -e "\n${GREEN}[${WHITE}+${GREEN}]${CYAN} Installing required packages..."
-
-	if [[ -d "/data/data/com.termux/files/home" ]]; then
-		if [[ ! $(command -v proot) ]]; then
-			echo -e "\n${GREEN}[${WHITE}+${GREEN}]${CYAN} Installing package : ${ORANGE}proot${CYAN}"${WHITE}
-			pkg install proot resolv-conf -y
-		fi
-
-		if [[ ! $(command -v tput) ]]; then
-			echo -e "\n${GREEN}[${WHITE}+${GREEN}]${CYAN} Installing package : ${ORANGE}ncurses-utils${CYAN}"${WHITE}
-			pkg install ncurses-utils -y
-		fi
-	fi
-
-	if [[ $(command -v php) && $(command -v curl) && $(command -v unzip) ]]; then
-		echo -e "\n${GREEN}[${WHITE}+${GREEN}]${GREEN} Packages already installed."
-	else
-		pkgs=(php curl unzip)
-		for pkg in "${pkgs[@]}"; do
-			type -p "$pkg" &>/dev/null || {
-				echo -e "\n${GREEN}[${WHITE}+${GREEN}]${CYAN} Installing package : ${ORANGE}$pkg${CYAN}"${WHITE}
-				if [[ $(command -v pkg) ]]; then
-					pkg install "$pkg" -y
-				elif [[ $(command -v apt) ]]; then
-					sudo apt install "$pkg" -y
-				elif [[ $(command -v apt-get) ]]; then
-					sudo apt-get install "$pkg" -y
-				elif [[ $(command -v pacman) ]]; then
-					sudo pacman -S "$pkg" --noconfirm
-				elif [[ $(command -v dnf) ]]; then
-					sudo dnf -y install "$pkg"
-				elif [[ $(command -v yum) ]]; then
-					sudo yum -y install "$pkg"
-				else
-					echo -e "\n${RED}[${WHITE}!${RED}]${RED} Unsupported package manager, Install packages manually."
-					{ reset_color; exit 1; }
-				fi
-			}
-		done
-	fi
+# Function to stop the PHP server
+stop_php_server() {
+    # Check if the PHP server is running
+    if pgrep -x "php" > /dev/null; then
+        # If running, stop the PHP server
+        pkill -f "php"
+    fi
 }
 
-# Download Binaries
-download() {
-	url="$1"
-	output="$2"
-	file=`basename $url`
-	if [[ -e "$file" || -e "$output" ]]; then
-		rm -rf "$file" "$output"
-	fi
-	curl --silent --insecure --fail --retry-connrefused \
-		--retry 3 --retry-delay 2 --location --output "${file}" "${url}"
-
-	if [[ -e "$file" ]]; then
-		if [[ ${file#*.} == "zip" ]]; then
-			unzip -qq $file > /dev/null 2>&1
-			mv -f $output .server/$output > /dev/null 2>&1
-		elif [[ ${file#*.} == "tgz" ]]; then
-			tar -zxf $file > /dev/null 2>&1
-			mv -f $output .server/$output > /dev/null 2>&1
-		else
-			mv -f $file .server/$output > /dev/null 2>&1
-		fi
-		chmod +x .server/$output > /dev/null 2>&1
-		rm -rf "$file"
-	else
-		echo -e "\n${RED}[${WHITE}!${RED}]${RED} Error occured while downloading ${output}."
-		{ reset_color; exit 1; }
-	fi
+# Function to stop the Node.js server
+stop_node_server() {
+    # Check if the Node.js server is running
+    if pgrep -x "node" > /dev/null; then
+        # If running, stop the Node.js server
+        pkill -f "node"
+    fi
 }
 
-## Install Cloudflared
-install_cloudflared() {
-	if [[ -e ".server/cloudflared" ]]; then
-		echo -e "\n${GREEN}[${WHITE}+${GREEN}]${GREEN} Cloudflared already installed."
-	else
-		echo -e "\n${GREEN}[${WHITE}+${GREEN}]${CYAN} Installing Cloudflared..."${WHITE}
-		arch=`uname -m`
-		if [[ ("$arch" == *'arm'*) || ("$arch" == *'Android'*) ]]; then
-			download 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm' 'cloudflared'
-		elif [[ "$arch" == *'aarch64'* ]]; then
-			download 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64' 'cloudflared'
-		elif [[ "$arch" == *'x86_64'* ]]; then
-			download 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64' 'cloudflared'
-		else
-			download 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-386' 'cloudflared'
-		fi
-	fi
+# Function to handle Telegram commands
+handle_telegram_command() {
+    local command="$1"
+    case "$command" in
+        start)
+            start_cloudflared
+            start_php_server
+            start_node_server
+            ;;
+        stop)
+            stop_cloudflared
+            stop_php_server
+            stop_node_server
+            ;;
+        *)
+            ;;
+    esac
 }
 
-## Exit message
-msg_exit() {
-	{ clear; banner; echo; }
-	echo -e "${GREENBG}${BLACK} Thank you for using this tool. Have a good day.${RESETBG}\n"
-	{ reset_color; exit 0; }
+# Function to send message to Telegram using Telegram Bot API
+send_telegram_message() {
+    local message="$1"
+    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" -d "chat_id=$CHAT_ID" -d "text=$message" > /dev/null
 }
 
-## About
-about() {
-	{ clear; banner; echo; }
-	cat <<- EOF
-		${GREEN} Author   ${RED}:  ${ORANGE}RANDOM RYAN ${RED}[ ${ORANGE}PROJECT-SARAH ${RED}]
-		${GREEN} Github   ${RED}:  ${CYAN}https://github.com/HackRyan
-		${GREEN} Version  ${RED}:  ${ORANGE}${__version__}
-
-		${WHITE} ${REDBG}Warning:${RESETBG}
-		${CYAN} This Server is made for educational purpose only ${RED}!
-		${WHITE}${CYAN} Author will not be responsible for any misuse of this toolkit ${RED}!${WHITE}
-		  
-		${RED}[${WHITE}00${RED}]${ORANGE} Main Menu     ${RED}[${WHITE}99${RED}]${ORANGE} Exit
-
-	EOF
-
-	read -p "${RED}[${WHITE}-${RED}]${GREEN} Select an option : ${BLUE}"
-	case $REPLY in 
-		99)
-			msg_exit;;
-		0 | 00)
-			echo -ne "\n${GREEN}[${WHITE}+${GREEN}]${CYAN} Returning to main menu..."
-			{ sleep 1; main_menu; };;
-		*)
-			echo -ne "\n${RED}[${WHITE}!${RED}]${RED} Invalid Option, Try Again..."
-			{ sleep 1; about; };;
-	esac
+# Function to send Cloudflare URL to Telegram
+send_cloudflare_url_to_telegram() {
+    local url="$1"
+    send_telegram_message "Cloudflare URL: $url"
 }
 
-## Choose custom port
-cusport() {
-	echo
-	read -n1 -p "${RED}[${WHITE}?${RED}]${ORANGE} Do You Want A Custom Port ${GREEN}[${CYAN}Y${GREEN}/${CYAN}N${GREEN}]: ${ORANGE}" P_ANS
-	if [[ ${P_ANS} =~ ^([yY])$ ]]; then
-		echo -e "\n"
-		read -n4 -p "${RED}[${WHITE}-${RED}]${ORANGE} Enter Your Custom 4-digit Port [1024-9999] : ${WHITE}" CU_P
-		if [[ ! -z  ${CU_P} && "${CU_P}" =~ ^([1-9][0-9][0-9][0-9])$ && ${CU_P} -ge 1024 ]]; then
-			PORT=${CU_P}
-			echo
-		else
-			echo -ne "\n\n${RED}[${WHITE}!${RED}]${RED} Invalid 4-digit Port : $CU_P, Try Again...${WHITE}"
-			{ sleep 2; clear; cusport; }
-		fi		
-	else 
-		echo -ne "\n\n${RED}[${WHITE}-${RED}]${BLUE} Using Default Port $PORT...${WHITE}\n"
-	fi
+# Function to listen for Telegram commands
+listen_for_telegram_commands() {
+    while true; do
+        local update_id
+        update_id=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates" | jq -r '.result[-1].update_id')
+        if [[ "$update_id" != "$LAST_UPDATE_ID" ]]; then
+            local command
+            command=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates" | jq -r '.result[-1].message.text')
+            handle_telegram_command "$command"
+            LAST_UPDATE_ID="$update_id"
+        fi
+        sleep 1
+    done
 }
 
-## Setup website and start php server
-setup_site() {
-	echo -e "\n${RED}[${WHITE}-${RED}]${BLUE} Setting up server..."${WHITE}
-	echo -ne "\n${RED}[${WHITE}-${RED}]${BLUE} Starting PHP server..."${WHITE}
-	cd your_site && php -S "$HOST":"$PORT" > /dev/null 2>&1 &
+# Function to update configuration file
+update_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Config file not found. Do you want to create a new Telegram config? (yes/no): "
+        read -r choice
+        if [[ "$choice" == "yes" ]]; then
+            echo "Enter your Telegram bot token: "
+            read -r bot_token
+            echo "Enter your Telegram chat ID: "
+            read -r chat_id
+            # Create new config file
+            echo "{\"bot_token\": \"$bot_token\", \"chat_id\": \"$chat_id\"}" > "$CONFIG_FILE"
+            echo "Config file created."
+        else
+            echo "Skipping Telegram config creation."
+        fi
+    else
+        echo "Config file already exists."
+    fi
 }
 
+# Function to activate Telegram bot
+activate_telegram_bot() {
+    # Read bot token and chat ID from config file
+    local bot_token=$(jq -r '.bot_token' "$CONFIG_FILE")
+    local chat_id=$(jq -r '.chat_id' "$CONFIG_FILE")
 
-## Start Cloudflared
-start_cloudflared() { 
-	rm .cld.log > /dev/null 2>&1 &
-	cusport
-	echo -e "\n${RED}[${WHITE}-${RED}]${GREEN} Initializing... ${GREEN}( ${CYAN}http://$HOST:$PORT ${GREEN})"
-	{ sleep 1; setup_site; }
-	echo -ne "\n\n${RED}[${WHITE}-${RED}]${GREEN} Alien Launching Your WebServer..."
-
-	if [[ `command -v termux-chroot` ]]; then
-		sleep 2 && termux-chroot ./.server/cloudflared tunnel -url "$HOST":"$PORT" --logfile .server/.cld.log > /dev/null 2>&1 &
-	else
-		sleep 2 && ./.server/cloudflared tunnel -url "$HOST":"$PORT" --logfile .server/.cld.log > /dev/null 2>&1 &
-	fi
-
-	sleep 8
-	cldflr_url=$(grep -o 'https://[-0-9a-z]*\.trycloudflare.com' ".server/.cld.log")
-	custom_url "$cldflr_url"
+    # Send activation message to Telegram
+    send_telegram_message "Bot activated successfully. Bot Token: $bot_token, Chat ID: $chat_id"
 }
 
-## Start localhost
-start_localhost() {
-	cusport
-	echo -e "\n${RED}[${WHITE}-${RED}]${GREEN} Initializing... ${GREEN}( ${CYAN}http://$HOST:$PORT ${GREEN})"
-	setup_site
-	{ sleep 1; clear; }
-	echo -e "\n${RED}[${WHITE}-${RED}]${GREEN} Successfully Hosted at : ${GREEN}${CYAN}http://$HOST:$PORT ${GREEN}"
+# MySQL Database Setup
+DB_NAME="multi_user_system"
+DB_USER="root"
+DB_PASS=""
+CONFIG_FILE="$WEBROOT/config.php"
+
+# Function to create database and tables
+setup_database() {
+    echo "Creating MySQL database and tables..."
+    mysql -u "$DB_USER" -p"$DB_PASS" -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;
+    USE $DB_NAME;
+    CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE,
+        password VARCHAR(255) NOT NULL,
+        email VARCHAR(100) NOT NULL UNIQUE,
+        role ENUM('admin', 'user') NOT NULL DEFAULT 'user',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );" || { echo "MySQL setup failed"; exit 1; }
 }
 
-## Tunnel selection
-tunnel_menu() {
-	{ clear; banner;}
-	start_cloudflared;
+# Function to create PHP config file
+create_config_file() {
+    cat <<EOL > "$CONFIG_FILE"
+<?php
+\$servername = "localhost";
+\$username = "$DB_USER";
+\$password = "$DB_PASS";
+\$dbname = "$DB_NAME";
+
+\$conn = new mysqli(\$servername, \$username, \$password, \$dbname);
+
+if (\$conn->connect_error) {
+    die("Connection failed: " . \$conn->connect_error);
+}
+?>
+EOL
 }
 
-## Custom Mask URL
-custom_mask() {
-	{ sleep .5; clear; banner; echo; }
-	read -n1 -p "${RED}[${WHITE}?${RED}]${ORANGE} Do you want to change Mask URL? ${GREEN}[${CYAN}Y${GREEN}/${CYAN}N${GREEN}] :${ORANGE} " mask_op
-	echo
-	if [[ ${mask_op,,} == "y" ]]; then
-		echo -e "\n${RED}[${WHITE}-${RED}]${GREEN} Enter your custom URL below ${CYAN}(${ORANGE}Example: https://get-free-followers.com${CYAN})\n"
-		read -e -p "${WHITE} ==> ${ORANGE}" -i "https://" mask_url # initial text requires Bash 4+
-		if [[ ${mask_url//:*} =~ ^([h][t][t][p][s]?)$ || ${mask_url::3} == "www" ]] && [[ ${mask_url#http*//} =~ ^[^,~!@%:\=\#\;\^\*\"\'\|\?+\<\>\(\{\)\}\\/]+$ ]]; then
-			mask=$mask_url
-			echo -e "\n${RED}[${WHITE}-${RED}]${CYAN} Using custom Masked Url :${GREEN} $mask"
-		else
-			echo -e "\n${RED}[${WHITE}!${RED}]${ORANGE} Invalid url type..Using the Default one.."
-		fi
-	fi
+# Function to create PHP files
+create_php_files() {
+    cat <<EOL > "$WEBROOT/register.php"
+<?php
+include 'config.php';
+
+if (\$_SERVER["REQUEST_METHOD"] == "POST") {
+    \$username = \$_POST['username'];
+    \$password = password_hash(\$_POST['password'], PASSWORD_BCRYPT);
+    \$email = \$_POST['email'];
+    \$role = 'user'; // Default role
+
+    \$stmt = \$conn->prepare("INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)");
+    \$stmt->bind_param("ssss", \$username, \$password, \$email, \$role);
+
+    if (\$stmt->execute()) {
+        echo "Registration successful!";
+    } else {
+        echo "Error: " . \$stmt->error;
+    }
+
+    \$stmt->close();
+    \$conn->close();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Register</title>
+</head>
+<body>
+    <form method="post" action="">
+        <label for="username">Username:</label>
+        <input type="text" id="username" name="username" required>
+        <br>
+        <label for="password">Password:</label>
+        <input type="password" id="password" name="password" required>
+        <br>
+        <label for="email">Email:</label>
+        <input type="email" id="email" name="email" required>
+        <br>
+        <button type="submit">Register</button>
+    </form>
+</body>
+</html>
+EOL
+
+    cat <<EOL > "$WEBROOT/login.php"
+<?php
+session_start();
+include 'config.php';
+
+if (\$_SERVER["REQUEST_METHOD"] == "POST") {
+    \$username = \$_POST['username'];
+    \$password = \$_POST['password'];
+
+    \$stmt = \$conn->prepare("SELECT id, username, password, role FROM users WHERE username = ?");
+    \$stmt->bind_param("s", \$username);
+    \$stmt->execute();
+    \$stmt->bind_result(\$id, \$username, \$hashed_password, \$role);
+    \$stmt->fetch();
+
+    if (password_verify(\$password, \$hashed_password)) {
+        \$_SESSION['user_id'] = \$id;
+        \$_SESSION['username'] = \$username;
+        \$_SESSION['role'] = \$role;
+        header("Location: dashboard.php");
+    } else {
+        echo "Invalid username or password.";
+    }
+
+    \$stmt->close();
+    \$conn->close();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Login</title>
+</head>
+<body>
+    <form method="post" action="">
+        <label for="username">Username:</label>
+        <input type="text" id="username" name="username" required>
+        <br>
+        <label for="password">Password:</label>
+        <input type="password" id="password" name="password" required>
+        <br>
+        <button type="submit">Login</button>
+    </form>
+</body>
+</html>
+EOL
+
+    cat <<EOL > "$WEBROOT/dashboard.php"
+<?php
+session_start();
+if (!isset(\$_SESSION['username'])) {
+    header("Location: login.php");
+    exit();
 }
 
-## URL Shortner
-site_stat() { [[ ${1} != "" ]] && curl -s -o "/dev/null" -w "%{http_code}" "${1}https://github.com"; }
+if (\$_SESSION['role'] == 'admin') {
+    header("Location: admin_panel.php");
+} else {
+    header("Location: user_panel.php");
+}
+?>
+EOL
 
-## Shorten for shortcode & tinyurl
-shorten() {
-	short=$(curl --silent --insecure --fail --retry-connrefused --retry 2 --retry-delay 2 "$1$2")
-	if [[ "$1" == *"shrtco.de"* ]]; then
-		processed_url=$(echo ${short} | sed 's/\\//g' | grep -o '"short_link2":"[a-zA-Z0-9./-]*' | awk -F\" '{print $4}')
-	else
-		# processed_url=$(echo "$short" | awk -F// '{print $NF}')
-		processed_url=${short#http*//}
-	fi
+    cat <<EOL > "$WEBROOT/admin_panel.php"
+<?php
+session_start();
+if (\$_SESSION['role'] != 'admin') {
+    header("Location: login.php");
+    exit();
 }
 
-## Shorteny for isgd
-shorteny() {
-	short=$(curl --silent --insecure --fail --retry-connrefused --retry 2 --retry-delay 2 "$1$2")
-	if [[ "$1" == *"shrtco.de"* ]]; then
-		processed_url=$(echo ${short} | sed 's/\\//g' | grep -o '"short_link2":"[a-zA-Z0-9./-]*' | awk -F\" '{print $4}')
-	else
-		# processed_url=$(echo "$short" | awk -F// '{print $NF}')
-		processed_url="www."${short#http*//}
-	fi
+include 'config.php';
+
+if (\$_SERVER["REQUEST_METHOD"] == "POST") {
+    \$username = \$_POST['username'];
+    \$password = password_hash(\$_POST['password'], PASSWORD_BCRYPT);
+    \$email = \$_POST['email'];
+    \$role = \$_POST['role'];
+
+    \$stmt = \$conn->prepare("INSERT INTO users (username, password, email, role) VALUES (?, ?, ?, ?)");
+    \$stmt->bind_param("ssss", \$username, \$password, \$email, \$role);
+
+    if (\$stmt->execute()) {
+        echo "User created successfully!";
+    } else {
+        echo "Error: " . \$stmt->error;
+    }
+
+    \$stmt->close();
 }
 
-## cleanuri for cleanuri
-Cleanuri() {
-	short=$(curl -s -X POST -d "url=$2" "$1" | jq -r '.result_url')
-	processed_url=${short#http*//}
+\$result = \$conn->query("SELECT id, username, email, role, created_at FROM users");
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Panel</title>
+</head>
+<body>
+    <h1>Welcome, <?php echo \$_SESSION['username']; ?></h1>
+    <h2>Create New User</h2>
+    <form method="post" action="">
+        <label for="username">Username:</label>
+        <input type="text" id="username" name="username" required>
+        <br>
+        <label for="password">Password:</label>
+        <input type="password" id="password" name="password" required>
+        <br>
+        <label for="email">Email:</label>
+        <input type="email" id="email" name="email" required>
+        <br>
+        <label for="role">Role:</label>
+        <select id="role" name="role" required>
+            <option value="user">User</option>
+            <option value="admin">Admin</option>
+        </select>
+        <br>
+        <button type="submit">Create User</button>
+    </form>
+    <h2>Existing Users</h2>
+    <table border="1">
+        <tr>
+            <th>ID</th>
+            <th>Username</th>
+            <th>Email</th>
+            <th>Role</th>
+            <th>Created At</th>
+        </tr>
+        <?php while (\$row = \$result->fetch_assoc()): ?>
+            <tr>
+                <td><?php echo \$row['id']; ?></td>
+                <td><?php echo \$row['username']; ?></td>
+                <td><?php echo \$row['email']; ?></td>
+                <td><?php echo \$row['role']; ?></td>
+                <td><?php echo \$row['created_at']; ?></td>
+            </tr>
+        <?php endwhile; ?>
+    </table>
+</body>
+</html>
+EOL
+
+    cat <<EOL > "$WEBROOT/user_panel.php"
+<?php
+session_start();
+if (\$_SESSION['role'] != 'user') {
+    header("Location: login.php");
+    exit();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>User Panel</title>
+</head>
+<body>
+    <h1>Welcome, <?php echo \$_SESSION['username']; ?></h1>
+    <p>This is the user panel.</p>
+</body>
+</html>
+EOL
 }
 
-custom_url() {
-	url=${1#http*//}
-	cleanuri="https://cleanuri.com/api/v1/shorten"
-	isgd="https://www.is.gd/create.php?format=simple&url="
-	shortcode="https://api.shrtco.de/v2/shorten?url="
-	tinyurl="https://tinyurl.com/api-create.php?url="
+# Create file organization and fixing script
+create_file_management_script() {
+    cat <<EOL > "$WEBROOT/organize_and_fix.sh"
+#!/bin/bash
 
-	{ custom_mask; sleep 1; clear; banner; }
-	if [[ ${url} =~ [-a-zA-Z0-9.]*(ngrok.io|trycloudflare.com|loclx.io) ]]; then
-		if [[ $(curl -i -s -X POST -d "url=https://example.com" https://cleanuri.com/api/v1/shorten | grep -i 'HTTP/' | awk '{print $2}') == 2* ]]; then
-			Cleanuri $cleanuri "https://$url"
-		elif [[ $(site_stat $isgd) == 2* ]]; then
-			shorteny $isgd "$url"
-		elif [[ $(site_stat $shortcode) == 2* ]]; then
-			shorten $shortcode "$url"
-		else
-			shorten $tinyurl "$url"
-		fi
+# Set up directories and files
+WEBROOT=".server/www"
+BACKUP_DIR=".server/backup"
+NEW_WEBROOT=".server/new_www"
+CONFIG_DIR="$NEW_WEBROOT/config"
+TMP_CONFIG_FILE="/tmp/merged_config.php"
+NO_ACCESS_SCRIPT="<?php http_response_code(403); echo 'Access forbidden.'; exit(); ?>"
+ANTI_FRAUD_CODE="<?php
+if (!defined('AUTHORIZED_ACCESS')) {
+    http_response_code(403);
+    echo 'Access forbidden.';
+    exit();
+}
+?>"
 
-		url="https://$url"
-		masked_url="$mask@$processed_url"
-		processed_url="https://$processed_url"
-	else
-		# echo "[!] No url provided / Regex Not Matched"
-		url="Unable to generate links. Try after turning on hotspot"
-		processed_url="Unable to Short URL"
-	fi
+# Create necessary directories
+mkdir -p "$BACKUP_DIR"
+mkdir -p "$NEW_WEBROOT"
+mkdir -p "$CONFIG_DIR"
 
-	echo -e "\n${RED}[${WHITE}-${RED}]${BLUE} URL 1 : ${GREEN}$url"
-	echo -e "\n${RED}[${WHITE}-${RED}]${BLUE} URL 2 : ${ORANGE}$processed_url"
-	[[ $processed_url != *"Unable"* ]] && echo -e "\n${RED}[${WHITE}-${RED}]${BLUE} URL 3 : ${ORANGE}$masked_url"
-	echo
-	if pidof cloudflared > /dev/null; then
-        	echo -ne "\n${RED}[${WHITE}-${RED}]${ORANGE} Your server is running...${BLUE}Ctrl + C ${ORANGE}to exit.\n"
-    	else
-        	echo "  Your server is not running, Try again with new port."
-    	fi
-	# Wait for user input to exit the program gracefully
-	while true; do
-	    read -r -n 1 -p "" input
-	    if [[ $input == $'\x03' ]]; then
-	        # Ctrl+C pressed again, exit immediately
-	        exit_program
-	    fi
-	done
+# Define topic directories
+declare -A TOPIC_DIRS=(
+    ["user"]="$NEW_WEBROOT/user"
+    ["admin"]="$NEW_WEBROOT/admin"
+    ["config"]="$NEW_WEBROOT/config"
+    ["content"]="$NEW_WEBROOT/content"
+    ["media"]="$NEW_WEBROOT/media"
+    ["misc"]="$NEW_WEBROOT/misc"
+)
+
+# Create topic directories
+for dir in "\${TOPIC_DIRS[@]}"; do
+    mkdir -p "\$dir"
+done
+
+# Backup the current webroot
+timestamp=\$(date +"%Y%m%d%H%M%S")
+cp -r "\$WEBROOT" "\$BACKUP_DIR/webroot_backup_\$timestamp"
+
+# Initialize the merged config file
+echo "<?php" > "\$TMP_CONFIG_FILE"
+
+# Function to scan files for configuration includes and paths
+scan_files() {
+    local dir="\$1"
+    find "\$dir" -type f \\( -name "*.php" -o -name "*.ini" -o -name "*.conf" -o -name "*.html" -o -name "*.css" -o -name "*.js" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" -o -name "*.gif" -o -name "*.bmp" -o -name "*.tiff" \\)
 }
 
-## Server menu
-server_menu() {
-	mask='https://lxance'
-	tunnel_menu;
+# Function to update config paths and other file paths in files
+update_paths_in_file() {
+    local file="\$1"
+    local old_path="\$2"
+    local new_path="\$3"
+    sed -i "s|\$old_path|\$new_path|g" "\$file"
 }
 
-## Menu
-main_menu() {
-	{ clear; banner; echo; }
-	cat <<- EOF
-		 THIS PROJECT WAS MADE STRICKLY FOR EDUCATION...  
-	EOF
-	
-	read -p "${RED}[${WHITE}-${RED}]${GREEN} Continue ? Y/N : ${BLUE}"
-
-	case $REPLY in 
-		Y | y)
-			server_menu;;
-		99)
-			about;;
-		0 | 00 )
-			msg_exit;;
-		*)
-			echo -ne "\n${RED}[${WHITE}!${RED}]${RED} Invalid Option, Try Again..."
-			{ sleep 1; main_menu; };;
-	
-	esac
+# Function to merge configuration files
+merge_config_files() {
+    local config_file="\$1"
+    cat "\$config_file" >> "\$TMP_CONFIG_FILE"
+    echo "" >> "\$TMP_CONFIG_FILE"
 }
 
-## Main
-kill_pid
-dependencies
-install_cloudflared
-main_menu
+# Function to fix broken HTML, JS, or PHP files
+fix_broken_files() {
+    local file="\$1"
+    local ext="\${file##*.}"
+    case "\$ext" in
+        php)
+            if ! php -l "\$file" > /dev/null 2>&1; then
+                echo "\$NO_ACCESS_SCRIPT" > "\$file"
+            fi
+            ;;
+        html|js)
+            # Simple fix: Just ensure the file is not empty
+            if [ ! -s "\$file" ]; then
+                echo "\$NO_ACCESS_SCRIPT" > "\$file"
+            fi
+            ;;
+    esac
+}
+
+# Function to compute file hash
+compute_file_hash() {
+    local file="\$1"
+    sha256sum "\$file" | awk '{ print \$1 }'
+}
+
+# Function to add anti-fraud code to PHP files
+add_anti_fraud_code() {
+    local file="\$1"
+    if ! grep -q "AUTHORIZED_ACCESS" "\$file"; then
+        echo "\$ANTI_FRAUD_CODE" | cat - "\$file" > temp && mv temp "\$file"
+    fi
+}
+
+# Function to determine new file path based on topic
+get_new_file_path() {
+    local file="\$1"
+    local base_name="\$(basename "\$file")"
+    
+    case "\$file" in
+        *user*) echo "\${TOPIC_DIRS[user]}/\$base_name" ;;
+        *admin*) echo "\${TOPIC_DIRS[admin]}/\$base_name" ;;
+        *config*) echo "\${TOPIC_DIRS[config]}/\$base_name" ;;
+        *content*) echo "\${TOPIC_DIRS[content]}/\$base_name" ;;
+        *media*) echo "\${TOPIC_DIRS[media]}/\$base_name" ;;
+        *) echo "\${TOPIC_DIRS[misc]}/\$base_name" ;;
+    esac
+}
+
+# Function to handle files and configuration
+handle_files() {
+    local file="\$1"
+    local new_file_path
+    new_file_path=\$(get_new_file_path "\$file")
+    local new_file_dir
+    new_file_dir=\$(dirname "\$new_file_path")
+
+    mkdir -p "\$new_file_dir"
+
+    # If the file already exists and has different content, rename the new file
+    if [ -f "\$new_file_path" ]; then
+        local existing_file_hash
+        existing_file_hash=\$(compute_file_hash "\$new_file_path")
+        local new_file_hash
+        new_file_hash=\$(compute_file_hash "\$file")
+        if [ "\$existing_file_hash" != "\$new_file_hash" ]; then
+            echo "Different content found: \$file"
+            new_file_path="\${new_file_path%.*}_\$(date +%s).\${new_file_path##*.}"
+        fi
+    fi
+
+    cp "\$file" "\$new_file_path"
+    fix_broken_files "\$new_file_path"
+    add_anti_fraud_code "\$new_file_path"
+}
+
+# Scan files, update paths, merge config paths, and fix broken files
+while IFS= read -r file; do
+    echo "Processing \$file"
+
+    # Handle the file (copy and fix if necessary)
+    handle_files "\$file"
+
+    # Search for included config files and update their paths
+    grep -E "require|include|config" "\$file" | grep -oE "(['\"]).*\1" | while read -r config_path; do
+        config_path=\$(echo "\$config_path" | tr -d "'\"")
+
+        if [[ -f "\$config_path" ]]; then
+            echo "Found config: \$config_path"
+
+            # Update config paths in the original file
+            update_paths_in_file "\$file" "\$config_path" "\$MERGED_CONFIG_FILE"
+
+            # Merge config content
+            merge_config_files "\$config_path"
+
+            # Move the original config file to the config directory
+            mv "\$config_path" "\$CONFIG_DIR/"
+        fi
+    done
+
+    # Update paths for other files if necessary
+    grep -oP "(?<=['\"]).*?(?=['\"])" "\$file" | while read -r path; do
+        if [[ -f "\$WEBROOT/\$path" ]]; then
+            new_path=\$(get_new_file_path "\$WEBROOT/\$path")
+            update_paths_in_file "\$file" "\$path" "\$new_path"
+        fi
+    done
+done < <(scan_files "\$WEBROOT")
+
+# Move the merged config file to the config directory
+mv "\$TMP_CONFIG_FILE" "\$MERGED_CONFIG_FILE"
+
+echo "All configurations have been merged into \$MERGED_CONFIG_FILE"
+echo "New webroot created at \$NEW_WEBROOT"
+EOL
+
+    # Make the organize and fix script executable
+    chmod +x "$WEBROOT/organize_and_fix.sh"
+}
+
+# Function to create file management PHP script
+create_file_management_php() {
+    cat <<EOL > "$WEBROOT/file_management.php"
+<?php
+session_start();
+if (\$_SESSION['role'] != 'admin') {
+    header("Location: login.php");
+    exit();
+}
+
+// Include the script for file management
+include 'organize_and_fix.sh';
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>File Management</title>
+</head>
+<body>
+    <h1>File Management</h1>
+    <form method="post" action="">
+        <button type="submit" name="organize">Organize and Fix Files</button>
+    </form>
+    <?php
+    if (isset(\$_POST['organize'])) {
+        // Execute the script
+        shell_exec('./organize_and_fix.sh');
+        echo "<p>Files have been organized and fixed.</p>";
+    }
+    ?>
+</body>
+</html>
+EOL
+}
+
+# Main function
+main() {
+    clear
+    echo "Starting setup..."
+
+    # Install MySQL if not already installed
+    install_mysql
+
+    # Setup database
+    setup_database
+
+    # Create PHP config file
+    create_config_file
+
+    # Create PHP files for user system
+    create_php_files
+
+    # Create file management scripts
+    create_file_management_script
+    create_file_management_php
+
+    echo "Setup completed. Navigate to your web root to access the system."
+}
+
+# Run the main function
+main
